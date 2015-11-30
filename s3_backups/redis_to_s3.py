@@ -5,7 +5,9 @@ from boto.s3.key import Key
 from boto.exception import S3ResponseError
 from datetime import datetime
 from s3_backups.utils import ColoredFormatter, timeit
+from multiprocessing import Pool
 from dateutil import tz
+from math import ceil
 
 import importlib
 import tarfile
@@ -13,6 +15,7 @@ import subprocess
 import tempfile
 import argparse
 import logging
+import time
 import sys
 import re
 import os
@@ -53,7 +56,71 @@ def backup():
     tar.close()
 
     log.info("Uploading the " + FILENAME + " file to Amazon S3 ...")
+    multipart_upload(t2, key_name + FILENAME)
 
+    t2.close()
+
+
+def do_part_upload(args):
+    """
+    Upload a part of a MultiPartUpload
+    Open the target file and read in a chunk. Since we can't pickle
+    S3Connection or MultiPartUpload objects, we have to reconnect and lookup
+    the MPU object with each part upload.
+    :type args: tuple of (string, string, string, int, int, int)
+    :param args: The actual arguments of this method. Due to lameness of
+                 multiprocessing, we have to extract these outside of the
+                 function definition.
+                 The arguments are: S3 Bucket name, MultiPartUpload id, file
+                 name, the part number, part offset, part size
+    """
+    # Multiprocessing args lameness
+    s3, bucket_name, mpu_id, fname, i, start, size, secure, max_tries, current_tries = args
+    log.debug("do_part_upload got args: %s" % (args,))
+
+    # Get the MultiPartUpload
+    s3.is_secure = secure
+    bucket = s3.lookup(bucket_name)
+    mpu = None
+    for mp in bucket.list_multipart_uploads():
+        if mp.id == mpu_id:
+            mpu = mp
+            break
+    if mpu is None:
+        raise Exception("Could not find MultiPartUpload %s" % mpu_id)
+
+    # Read the chunk from the file
+    fp = open(fname, 'rb')
+    fp.seek(start)
+    data = fp.read(size)
+    fp.close()
+    if not data:
+        raise Exception("Unexpectedly tried to read an empty chunk")
+
+    def progress(x, y):
+        log.debug("Part %d: %0.2f%%" % (i+1, 100.*x/y))
+
+    try:
+        # Do the upload
+        t1 = time.time()
+        mpu.upload_part_from_file(StringIO(data), i+1, cb=progress)
+
+        # Print some timings
+        t2 = time.time() - t1
+        s = len(data)/1024./1024.
+        log.info("Uploaded part %s (%0.2fM) in %0.2fs at %0.2fMBps" % (i+1, s, t2, s/t2))
+    except Exception, err:
+        log.debug("Retry request %d of max %d times" % (current_tries, max_tries))
+        if (current_tries > max_tries):
+            log.error(err)
+        else:
+            time.sleep(3)
+            current_tries += 1
+
+
+def multipart_upload(src, dest, num_processes=2, split=2,
+                     force=False, secure=False, reduced_redundancy=False,
+                     verbose=False, quiet=False, max_tries=5):
     # get bucket
     conn = S3Connection(AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
 
@@ -62,16 +129,73 @@ def backup():
     except S3ResponseError:
         sys.stderr.write("There is no bucket with the name \"" + S3_BUCKET_NAME + "\" in your Amazon S3 account\n")
         sys.stderr.write("Error: Please enter an appropriate bucket name and re-run the script\n")
-        t2.close()
+        src.close()
         return
 
     # upload file to Amazon S3
-    k = Key(bucket)
-    k.key = key_name + FILENAME
-    k.set_contents_from_filename(t2.name)
-    t2.close()
+    # Determine the splits
+    part_size = max(5*1024*1024, 1024*1024*split)
+    src.seek(0, 2)
+    size = src.tell()
+    num_parts = int(ceil(size / part_size))
 
-    log.info("Sucessfully uploaded the archive to Amazon S3")
+    # If file is less than 5M, just upload it directly
+    if size < 5*1024*1024:
+        src.seek(0)
+        t1 = time.time()
+        k = Key(bucket)
+        k.key = dest
+        k.set_contents_from_file(src)
+        t2 = time.time() - t1
+        s = size/1024./1024.
+        log.info("Finished uploading %0.2fM in %0.2fs (%0.2fMBps)" % (s, t2, s/t2))
+        return
+
+    # Create the multi-part upload object
+    mpu = bucket.initiate_multipart_upload(dest,
+                                           reduced_redundancy=reduced_redundancy
+                                           )
+    log.info("Initialized upload: %s" % mpu.id)
+
+    # Generate arguments for invocations of do_part_upload
+    def gen_args(num_parts, fold_last):
+        for i in range(num_parts+1):
+            part_start = part_size*i
+            if i == (num_parts-1) and fold_last is True:
+                yield (conn, bucket.name, mpu.id, src.name, i, part_start,
+                       part_size*2, secure, max_tries, 0)
+                break
+            else:
+                yield (conn, bucket.name, mpu.id, src.name, i, part_start,
+                       part_size, secure, max_tries, 0)
+
+    # If the last part is less than 5M, just fold it into the previous part
+    fold_last = ((size % part_size) < 5*1024*1024)
+
+    # Do the thing
+    try:
+        # Create a pool of workers
+        pool = Pool(processes=num_processes)
+        t1 = time.time()
+        pool.map_async(do_part_upload, gen_args(
+            num_parts, fold_last)).get(9999999)
+        # Print out some timings
+        t2 = time.time() - t1
+        s = size/1024./1024.
+        # Finalize
+        src.close()
+        mpu.complete_upload()
+        log.info("Finished uploading %0.2fM in %0.2fs (%0.2fMBps)" % (s, t2, s/t2))
+    except KeyboardInterrupt:
+        log.warn("Received KeyboardInterrupt, canceling upload")
+        pool.terminate()
+        mpu.cancel_upload()
+    except Exception, err:
+        log.error("Encountered an error, canceling upload")
+        log.error(err)
+        mpu.cancel_upload()
+
+    log.info("Successfully uploaded the archive to Amazon S3")
 
 
 class archive(object):
